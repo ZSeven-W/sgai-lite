@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sys
 import argparse
+import shutil
 
 try:
     from colorama import init as colorama_init, Fore, Style
@@ -22,26 +23,60 @@ except ImportError:
 from sgai_lite import __version__
 from sgai_lite.generator import (
     generate_code_stream,
+    generate_code,
     CodeGenerationError,
     APIKeyMissingError,
+    ValidationError,
     DEFAULT_MODEL,
 )
 from sgai_lite.languages import detect_language, get_extension, get_language_name, LANGUAGE_MAP
+from sgai_lite.history import add_entry, list_entries, get_entry, format_entries, clear_history
+from sgai_lite.config import load_config
+
+try:
+    import yaml
+    HAS_YAML = True
+except ImportError:
+    HAS_YAML = False
+
+
+def _bold(text: str) -> str:
+    return f"{_BOLD}{text}{_RESET}" if _BOLD else text
+
+
+def _cyan(text: str) -> str:
+    return f"{_CYAN}{text}{_RESET}" if _CYAN else text
+
+
+def _green(text: str) -> str:
+    return f"{_GREEN}{text}{_RESET}" if _GREEN else text
+
+
+def _yellow(text: str) -> str:
+    return f"{_YELLOW}{text}{_RESET}" if _YELLOW else text
+
+
+def _red(text: str) -> str:
+    return f"{_RED}{text}{_RESET}" if _RED else text
 
 
 def _print_header(goal: str, lang: str | None):
     lang_display = lang if lang else f"auto ({get_language_name(detect_language(goal))})"
-    print(f"{_BOLD}{_CYAN}sgai-lite{_RESET} — generating [{lang_display}]...")
-    print(f"{_BOLD}Goal:{_RESET} {goal}")
+    print(f"{_bold(_cyan('sgai-lite'))} — generating [{lang_display}]...")
+    print(f"{_bold('Goal:')} {goal}")
     print()
 
 
 def _print_error(msg: str):
-    print(f"{_RED}Error:{_RESET} {msg}", file=sys.stderr)
+    print(f"{_red('Error:')} {msg}", file=sys.stderr)
 
 
 def _print_warning(msg: str):
-    print(f"{_YELLOW}Warning:{_RESET} {msg}", file=sys.stderr)
+    print(f"{_yellow('Warning:')} {msg}", file=sys.stderr)
+
+
+def _print_success(msg: str):
+    print(f"{_green('✓')} {msg}")
 
 
 def _write_file(output_path: str, content: str) -> bool:
@@ -56,6 +91,143 @@ def _write_file(output_path: str, content: str) -> bool:
         return False
 
 
+def _format_code(code: str, formatter: str | None) -> str:
+    """Apply code formatter if available."""
+    if not formatter:
+        return code
+
+    import tempfile, subprocess
+
+    if formatter == "black":
+        tool = shutil.which("black")
+        if not tool:
+            _print_warning("black not found. Install: pip install black")
+            return code
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".py", delete=False, mode="w") as f:
+                f.write(code)
+                f.flush()
+                tmp = f.name
+            result = subprocess.run([tool, tmp], capture_output=True, text=True, timeout=30)
+            if result.returncode == 0:
+                return open(tmp).read()
+            else:
+                _print_warning(f"black failed: {result.stderr.strip()}")
+        except Exception as e:
+            _print_warning(f"Formatting error: {e}")
+        finally:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+
+    elif formatter == "ruff":
+        tool = shutil.which("ruff")
+        if not tool:
+            _print_warning("ruff not found. Install: pip install ruff")
+            return code
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".py", delete=False, mode="w") as f:
+                f.write(code)
+                f.flush()
+                tmp = f.name
+            result = subprocess.run([tool, "format", tmp], capture_output=True, text=True, timeout=30)
+            if result.returncode == 0:
+                return open(tmp).read()
+            else:
+                _print_warning(f"ruff format failed: {result.stderr.strip()}")
+        except Exception as e:
+            _print_warning(f"Formatting error: {e}")
+        finally:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+
+    elif formatter == "autopep8":
+        tool = shutil.which("autopep8")
+        if not tool:
+            _print_warning("autopep8 not found. Install: pip install autopep8")
+            return code
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".py", delete=False, mode="w") as f:
+                f.write(code)
+                f.flush()
+                tmp = f.name
+            result = subprocess.run([tool, "-i", tmp], capture_output=True, text=True, timeout=30)
+            if result.returncode == 0:
+                return open(tmp).read()
+        except Exception as e:
+            _print_warning(f"Formatting error: {e}")
+        finally:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+
+    return code
+
+
+def _show_history(n: int = 10):
+    """Show generation history."""
+    entries = list_entries(n=n)
+    print(_bold(f"Last {len(entries)} generation(s):"))
+    print()
+    print(format_entries(entries))
+
+
+def _rerun_from_history(index: int):
+    """Regenerate from a history entry."""
+    entry = get_entry(index)
+    if not entry:
+        _print_error(f"History entry #{index} not found.")
+        return None
+    return entry
+
+
+def _interactive_refine(code: str, language: str, model: str, temperature: float, output_path: str) -> str | None:
+    """Ask user if they want to refine, handle refinement loop."""
+    try:
+        response = input(f"\n{_yellow('Refine this code?')} (y/n) or shortcut (fix/tests/docs/faster): ").strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        print()
+        return None
+
+    if response in ("n", "no", ""):
+        return None
+
+    shortcuts = {
+        "fix": "fix all bugs and improve error handling",
+        "tests": "add comprehensive unit tests using pytest",
+        "docs": "add detailed docstrings and comments",
+        "faster": "optimize for performance and efficiency",
+    }
+
+    if response in shortcuts:
+        refinement = shortcuts[response]
+    elif response == "y":
+        refinement = input(f"{_cyan('What should I change?')} ").strip()
+        if not refinement:
+            return None
+    else:
+        refinement = response
+
+    print(f"\n{_cyan('Refining...')} ({refinement})")
+    try:
+        new_code = generate_code(
+            goal="",  # empty since we're refining
+            language=language,
+            model=model,
+            temperature=temperature,
+            refinement=refinement,
+            existing_code=code,
+        )
+        return new_code
+    except Exception as e:
+        _print_error(f"Refinement failed: {e}")
+        return None
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="sgai",
@@ -63,14 +235,18 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  sgai \"a Python script that prints hello world with a timestamp\"
-  sgai --lang ts \"a TypeScript function that validates email addresses\"
-  sgai --output server.py \"a Python HTTP server with GET /hello\"
-  sgai --model gpt-4o-mini \"a bash script to find large files\"
+  sgai "a Python script that prints hello world with a timestamp"
+  sgai --lang ts "a TypeScript function that validates email addresses"
+  sgai --output server.py "a Python HTTP server with GET /hello"
+  sgai --model gpt-4o-mini "a bash script to find large files"
+  sgai --history              # Show last 10 generations
+  sgai --rerun 3              # Regenerate from history entry #3
+  sgai --refine "add tests" --input output.py
 
 Environment:
   OPENAI_API_KEY   Your OpenAI API key (required)
-  OPENAI_BASE_URL Custom API base URL (optional, for proxies)
+  OPENAI_BASE_URL  Custom API base URL (optional, for proxies)
+  SGAI_CONFIG      Path to config file (optional)
         """,
     )
 
@@ -92,19 +268,63 @@ Environment:
     )
     parser.add_argument(
         "-m", "--model",
-        default=DEFAULT_MODEL,
-        help=f"OpenAI model (default: {DEFAULT_MODEL})",
+        default=None,  # Will be filled from config
+        help="OpenAI model",
     )
     parser.add_argument(
         "--temp",
         type=float,
-        default=0.3,
-        help="Sampling temperature 0.0-2.0 (default: 0.3, lower=more deterministic)",
+        default=None,  # Will be filled from config
+        help="Sampling temperature 0.0-2.0 (default: 0.3)",
+    )
+    parser.add_argument(
+        "--no-validate",
+        action="store_true",
+        help="Skip syntax validation after generation",
+    )
+    parser.add_argument(
+        "--formatter",
+        choices=["black", "ruff", "autopep8", "none"],
+        default=None,
+        help="Auto-format generated code (Python only)",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Show detected language and exit without generating",
+    )
+    parser.add_argument(
+        "--history",
+        action="store_true",
+        help="Show generation history",
+    )
+    parser.add_argument(
+        "--history-count",
+        type=int,
+        default=10,
+        metavar="N",
+        help="Number of history entries to show (default: 10)",
+    )
+    parser.add_argument(
+        "--rerun",
+        type=int,
+        metavar="N",
+        help="Regenerate from history entry N",
+    )
+    parser.add_argument(
+        "--refine",
+        metavar="INSTRUCTION",
+        help="Refine an existing file with instructions",
+    )
+    parser.add_argument(
+        "--input",
+        metavar="FILE",
+        help="Input file for --refine mode",
+    )
+    parser.add_argument(
+        "--clear-history",
+        action="store_true",
+        help="Clear all generation history",
     )
     parser.add_argument(
         "--list-langs",
@@ -119,11 +339,108 @@ Environment:
 
     args = parser.parse_args()
 
+    # Load config
+    config = load_config()
+
+    # Apply config defaults where CLI args aren't provided
+    if args.model is None:
+        args.model = config.get("default_model", DEFAULT_MODEL)
+    if args.temp is None:
+        args.temp = config.get("temperature", 0.3)
+    if args.formatter is None:
+        args.formatter = config.get("formatter")
+
     if args.list_langs:
-        print(f"{_BOLD}Supported languages:{_RESET}")
+        print(_bold("Supported languages:"))
         for lang in sorted(LANGUAGE_MAP.keys()):
             ext = LANGUAGE_MAP[lang]
             print(f"  {lang:15s} → {ext}")
+        return 0
+
+    if args.history:
+        _show_history(args.history_count)
+        return 0
+
+    if args.clear_history:
+        clear_history()
+        _print_success("History cleared.")
+        return 0
+
+    if args.refine:
+        if not args.input:
+            _print_error("--input FILE is required with --refine")
+            return 1
+        if not os.path.exists(args.input):
+            _print_error(f"File not found: {args.input}")
+            return 1
+        if not os.environ.get("OPENAI_API_KEY"):
+            _print_error("OPENAI_API_KEY is not set.")
+            return 1
+
+        code = open(args.input).read()
+        lang = args.language or detect_language(code)
+        print(f"{_cyan('Refining')} {args.input} ({lang})...")
+        try:
+            new_code = generate_code(
+                goal="",
+                language=lang,
+                model=args.model,
+                temperature=args.temp,
+                refinement=args.refine,
+                existing_code=code,
+            )
+            if _write_file(args.input, new_code):
+                _print_success(f"Refined and saved to {args.input}")
+            return 0
+        except Exception as e:
+            _print_error(str(e))
+            return 1
+
+    if args.rerun:
+        entry = _rerun_from_history(args.rerun)
+        if not entry:
+            return 1
+        if not os.environ.get("OPENAI_API_KEY"):
+            _print_error("OPENAI_API_KEY is not set.")
+            return 1
+
+        lang = args.language or entry.get("language")
+        model = entry.get("model", args.model)
+        goal = entry.get("goal", "")
+        output_path = args.output or entry.get("output_file") or f"output{get_extension(lang)}"
+
+        print(f"{_cyan('Regenerating')} from history #{args.rerun}...")
+        _print_header(goal, lang)
+
+        full_code = ""
+        try:
+            for chunk, done in generate_code_stream(
+                goal=goal,
+                language=lang,
+                model=model,
+                temperature=args.temp,
+                skip_validation=args.no_validate,
+            ):
+                if chunk:
+                    print(chunk, end="", flush=True)
+                    full_code += chunk
+                if done:
+                    break
+        except CodeGenerationError as e:
+            _print_error(str(e))
+            return 1
+
+        print()
+        if not full_code.strip():
+            _print_error("No code was generated.")
+            return 1
+
+        if _write_file(output_path, full_code):
+            _print_success(f"Saved to {output_path}")
+            line_count = full_code.count("\n") + 1
+            char_count = len(full_code)
+            print(f"  {line_count} lines, {char_count} chars")
+            add_entry(goal, lang, model, full_code, output_path, args.temp)
         return 0
 
     if not args.goal:
@@ -138,9 +455,9 @@ Environment:
         lang_display = language or detected
         ext = get_extension(lang_display)
         output = args.output or f"output{ext}"
-        print(f"{_BOLD}Language:{_RESET} {get_language_name(lang_display)}")
-        print(f"{_BOLD}Extension:{_RESET} {ext}")
-        print(f"{_BOLD}Output:{_RESET} {output}")
+        print(f"{_bold('Language:')} {get_language_name(lang_display)}")
+        print(f"{_bold('Extension:')} {ext}")
+        print(f"{_bold('Output:')} {output}")
         return 0
 
     # Check API key for actual generation
@@ -164,34 +481,62 @@ Environment:
 
     # Stream and display
     full_code = ""
+    validation_ok = True
     try:
-        for chunk in generate_code_stream(
+        for chunk, done in generate_code_stream(
             goal=args.goal,
             language=language,
             model=args.model,
             temperature=args.temp,
+            skip_validation=args.no_validate,
         ):
-            print(chunk, end="", flush=True)
-            full_code += chunk
+            if chunk:
+                print(chunk, end="", flush=True)
+                full_code += chunk
+            if done:
+                break
     except KeyboardInterrupt:
-        print(f"\n{_YELLOW}Interrupted by user.{_RESET}")
-        # Offer to save what was generated
+        print(f"\n{_yellow('Interrupted by user.')}")
         if full_code:
             save = input(f"\nSave partial output to {output_path}? [y/N]: ").strip().lower()
             if save == "y":
-                _write_file(output_path, full_code)
-                print(f"Saved partial output to {output_path}")
+                if _write_file(output_path, full_code):
+                    _print_success(f"Saved partial output to {output_path}")
         return 130
 
-    print()  # newline after streaming
+    print()
 
     if not full_code.strip():
         _print_error("No code was generated. Please try again.")
         return 1
 
+    # Format
+    if args.formatter and args.formatter != "none":
+        lang_key = language.lower().split()[0]
+        if lang_key == "python":
+            formatted = _format_code(full_code, args.formatter)
+            if formatted != full_code:
+                print(f"{_cyan('Formatted with')} {args.formatter}{_cyan(':')}")
+                full_code = formatted
+
     # Write to file
     if _write_file(output_path, full_code):
-        print(f"{_GREEN}{_BOLD}✓ Saved to {output_path}{_RESET}")
+        _print_success(f"Saved to {output_path}")
+        line_count = full_code.count("\n") + 1
+        char_count = len(full_code)
+        print(f"  {line_count} lines, {char_count} chars")
+
+    # Record history
+    entry_idx = add_entry(args.goal, language, args.model, full_code, output_path, args.temp)
+    print(f"  {args.output or output_path} #{entry_idx}")
+
+    # Interactive refinement
+    if sys.stdin.isatty():
+        new_code = _interactive_refine(full_code, language, args.model, args.temp, output_path)
+        if new_code and new_code != full_code:
+            if _write_file(output_path, new_code):
+                _print_success(f"Updated: {output_path}")
+                add_entry(args.goal + " [refined]", language, args.model, new_code, output_path, args.temp)
 
     return 0
 
