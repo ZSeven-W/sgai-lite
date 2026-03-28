@@ -64,6 +64,24 @@ LANG_SPECIFIC_TIPS = {
 - Include proper lifetime annotations
 - Write unit tests in the same file
 - Use idiomatic Rust patterns""",
+    "ruby": """Ruby-specific best practices:
+- Use Ruby's built-in methods and Enumerable
+- Include 'require' statements at the top
+- Use 'do...end' for multi-line blocks, '{ }' for single-line
+- Handle errors with begin/rescue/ensure
+- Use attr_accessor, attr_reader, attr_writer for class attributes""",
+    "php": """PHP-specific best practices:
+- Use strict types: declare(strict_types=1);
+- Prefer PSR-4 autoloading over require/include
+- Use type hints and return types where available
+- Handle errors with try/catch
+- Use prepared statements for database queries""",
+    "lua": """Lua-specific best practices:
+- Use local variables over globals
+- Return early for error conditions
+- Use table.insert/remove for array operations
+- Include proper nil checks
+- Use --[[ comment ]] for multi-line comments""",
 }
 
 

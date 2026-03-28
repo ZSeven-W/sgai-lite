@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import json
 import argparse
 import shutil
 
@@ -377,7 +378,7 @@ def _interactive_refine(code: str, language: str, model: str, temperature: float
 
     print(f"\n{_cyan('Refining...')} ({refinement})")
     try:
-        new_code = generate_code(
+        result = generate_code(
             goal="",  # empty since we're refining
             language=language,
             model=model,
@@ -385,7 +386,7 @@ def _interactive_refine(code: str, language: str, model: str, temperature: float
             refinement=refinement,
             existing_code=code,
         )
-        return new_code
+        return result.code
     except Exception as e:
         _print_error(f"Refinement failed: {e}")
         return None
@@ -519,6 +520,11 @@ Environment:
         action="store_true",
         help="Automatically commit the generated file to git (if in a git repo)",
     )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output machine-readable JSON with generation metadata",
+    )
 
     args = parser.parse_args()
 
@@ -564,7 +570,7 @@ Environment:
         lang = args.language or detect_language(code)
         print(f"{_cyan('Refining')} {args.input} ({lang})...")
         try:
-            new_code = generate_code(
+            result = generate_code(
                 goal="",
                 language=lang,
                 model=args.model,
@@ -572,8 +578,13 @@ Environment:
                 refinement=args.refine,
                 existing_code=code,
             )
+            new_code = result.code
             if _write_file(args.input, new_code):
                 _print_success(f"Refined and saved to {args.input}")
+                # Show usage info if available
+                if result.total_tokens is not None:
+                    print(f"  {_cyan('Tokens:')} {result.total_tokens} "
+                          f"(${result.estimated_cost:.4f})")
             return 0
         except Exception as e:
             _print_error(str(e))
@@ -599,8 +610,9 @@ Environment:
         import time as _time_module
         start_time = _time_module.time()
         last_spin = 0
+        last_usage = None
         try:
-            for chunk, done in generate_code_stream(
+            for chunk, done, usage in generate_code_stream(
                 goal=goal,
                 language=lang,
                 model=model,
@@ -616,6 +628,8 @@ Environment:
                         elapsed = int(now - start_time)
                         _print_spinner(f"Regenerating ({elapsed}s)")
                         last_spin = now
+                if usage:
+                    last_usage = usage
                 if done:
                     _clear_spinner()
                     break
@@ -685,8 +699,9 @@ Environment:
     import time as _time_module
     start_time = _time_module.time()
     last_spin = 0
+    last_usage = None
     try:
-        for chunk, done in generate_code_stream(
+        for chunk, done, usage in generate_code_stream(
             goal=args.goal,
             language=language,
             model=args.model,
@@ -705,6 +720,8 @@ Environment:
                     elapsed = int(now - start_time)
                     _print_spinner(f"Generating ({elapsed}s)")
                     last_spin = now
+            if usage:
+                last_usage = usage
             if done:
                 _clear_spinner()
                 break
@@ -725,6 +742,32 @@ Environment:
         _print_error("No code was generated. Please try again.")
         return 1
 
+    # JSON output mode — skip interactive/visual output
+    if args.json:
+        from datetime import datetime, timezone, timedelta
+        tz_sh = timezone(timedelta(hours=8))
+        usage = last_usage or {}
+        result = {
+            "goal": args.goal,
+            "language": language,
+            "model": args.model,
+            "temperature": args.temp,
+            "output_file": output_path,
+            "code": full_code,
+            "lines": full_code.count("\n") + 1,
+            "chars": len(full_code),
+            "elapsed_seconds": round(elapsed, 2),
+            "timestamp": datetime.now(tz_sh).isoformat(),
+            "usage": {
+                "prompt_tokens": usage.get("prompt_tokens"),
+                "completion_tokens": usage.get("completion_tokens"),
+                "total_tokens": usage.get("total_tokens"),
+                "estimated_cost_usd": round(usage.get("estimated_cost") or 0, 6),
+            },
+        }
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+
     # Format
     if args.formatter and args.formatter != "none":
         lang_key = language.lower().split()[0]
@@ -740,6 +783,17 @@ Environment:
         line_count = full_code.count("\n") + 1
         char_count = len(full_code)
         print(f"  {line_count} lines, {char_count} chars, {elapsed:.1f}s")
+
+        # Show token usage and cost
+        if last_usage and last_usage.get("total_tokens") is not None:
+            cost = last_usage.get("estimated_cost") or 0
+            pt = last_usage.get("prompt_tokens") or 0
+            ct = last_usage.get("completion_tokens") or 0
+            tt = last_usage.get("total_tokens") or 0
+            print(f"  {_cyan('Tokens:')} {tt} (prompt={pt}, completion={ct}) | "
+                  f"${cost:.4f}")
+        elif args.verbose:
+            print(f"  {_yellow('Tokens:')} not available (streaming mode)")
 
         # Verbose: show detected dependencies
         if args.verbose:

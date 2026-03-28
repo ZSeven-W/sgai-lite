@@ -151,11 +151,15 @@ class TestGenerateCode:
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "```python\nprint('hello world')\n```"
+        mock_response.usage.prompt_tokens = 100
+        mock_response.usage.completion_tokens = 20
+        mock_response.usage.total_tokens = 120
         mock_client.chat.completions.create.return_value = mock_response
         mock_get_client.return_value = mock_client
 
         result = generate_code("a Python script that prints hello world")
-        assert result == "print('hello world')"
+        assert result.code == "print('hello world')"
+        assert result.total_tokens == 120
 
     @patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test"}, clear=False)
     @patch("sgai_lite.generator.get_client")

@@ -8,7 +8,8 @@ import time
 import random
 import subprocess
 import tempfile
-from typing import Iterator
+import shutil
+from typing import Iterator, NamedTuple
 
 from openai import OpenAI, APIError, AuthenticationError, RateLimitError
 
@@ -18,7 +19,16 @@ from sgai_lite.prompts import build_system_prompt
 DEFAULT_MODEL = "gpt-4o"
 
 # Languages that support syntax validation
-VALIDATABLE_LANGUAGES = {"python", "py", "js", "javascript", "ts", "typescript", "bash", "sh", "shell"}
+VALIDATABLE_LANGUAGES = {"python", "py", "js", "javascript", "ts", "typescript", "bash", "sh", "shell", "go", "rust", "ruby", "php", "lua"}
+
+
+class GenerationResult(NamedTuple):
+    """Result of a code generation including usage metadata."""
+    code: str
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    total_tokens: int | None
+    estimated_cost: float | None
 
 # OpenAI pricing (approximate, per 1M tokens)
 PRICING = {
@@ -130,6 +140,16 @@ def validate_code(code: str, language: str) -> tuple[bool, str]:
         return _validate_js(code)
     elif lang in ("ts", "typescript"):
         return _validate_ts(code)
+    elif lang == "go":
+        return _validate_go(code)
+    elif lang == "rust":
+        return _validate_rust(code)
+    elif lang == "ruby":
+        return _validate_ruby(code)
+    elif lang == "php":
+        return _validate_php(code)
+    elif lang == "lua":
+        return _validate_lua(code)
 
     return True, "No validator available for this language"
 
@@ -214,6 +234,130 @@ def _validate_ts(code: str) -> tuple[bool, str]:
     return _validate_js(code)
 
 
+def _validate_go(code: str) -> tuple[bool, str]:
+    """Validate Go code with gofmt."""
+    tool = shutil.which("gofmt")
+    if not tool:
+        return True, "gofmt not found, skipping validation"
+    try:
+        result = subprocess.run(
+            [tool, "-e", "-l"],
+            input=code,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if result.returncode == 0:
+            return True, "Syntax OK"
+        errors = result.stderr.strip() or result.stdout.strip()
+        return False, errors if errors else "Syntax error in Go code"
+    except Exception as e:
+        return False, f"Validation error: {e}"
+
+
+def _validate_rust(code: str) -> tuple[bool, str]:
+    """Validate Rust code with rustfmt."""
+    tool = shutil.which("rustfmt")
+    if not tool:
+        return True, "rustfmt not found, skipping validation"
+    try:
+        result = subprocess.run(
+            [tool, "--check", "--"],
+            "-",
+            input=code,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if result.returncode == 0:
+            return True, "Syntax OK"
+        errors = result.stderr.strip() or result.stdout.strip()
+        return False, errors if errors else "Syntax error in Rust code"
+    except Exception as e:
+        return False, f"Validation error: {e}"
+
+
+def _validate_ruby(code: str) -> tuple[bool, str]:
+    """Validate Ruby code with ruby -c."""
+    tool = shutil.which("ruby")
+    if not tool:
+        return True, "ruby not found, skipping validation"
+    try:
+        result = subprocess.run(
+            [tool, "-c"],
+            input=code,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if result.returncode == 0:
+            return True, "Syntax OK"
+        return False, result.stderr.strip() or result.stdout.strip()
+    except Exception as e:
+        return False, f"Validation error: {e}"
+
+
+def _validate_php(code: str) -> tuple[bool, str]:
+    """Validate PHP code with php -l."""
+    tool = shutil.which("php")
+    if not tool:
+        return True, "php not found, skipping validation"
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".php", delete=False, mode="w") as f:
+            f.write(code)
+            f.flush()
+            tmp = f.name
+        result = subprocess.run(
+            [tool, "-l", tmp],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        os.unlink(tmp)
+        if result.returncode == 0:
+            return True, "Syntax OK"
+        return False, result.stdout.strip()
+    except Exception as e:
+        return False, f"Validation error: {e}"
+
+
+def _validate_lua(code: str) -> tuple[bool, str]:
+    """Validate Lua code with lua -p."""
+    tool = shutil.which("lua")
+    if not tool:
+        # Try luac (compiler)
+        tool = shutil.which("luac")
+        if not tool:
+            return True, "lua/luac not found, skipping validation"
+        try:
+            result = subprocess.run(
+                [tool, "-p", "-"],
+                input=code,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if result.returncode == 0:
+                return True, "Syntax OK"
+            return False, result.stderr.strip()
+        except Exception as e:
+            return False, f"Validation error: {e}"
+    else:
+        try:
+            result = subprocess.run(
+                [tool, "-p", "-"],
+                input=code,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if result.returncode == 0:
+                return True, "Syntax OK"
+            return False, result.stderr.strip()
+        except Exception as e:
+            return False, f"Validation error: {e}"
+
+
 def generate_code_stream(
     goal: str,
     language: str | None = None,
@@ -221,10 +365,11 @@ def generate_code_stream(
     temperature: float = 0.3,
     skip_validation: bool = False,
     refinement: str | None = None,
-) -> Iterator[tuple[str, bool]]:
-    """Generate code via OpenAI with streaming, yielding (chunk, done) tuples.
+) -> Iterator[tuple[str, bool, dict]]:
+    """Generate code via OpenAI with streaming, yielding (chunk, done, usage) tuples.
 
-    When done=True, the stream is finished.
+    When done=True, the stream is finished. usage dict contains:
+        prompt_tokens, completion_tokens, total_tokens, estimated_cost
 
     Args:
         goal: Natural language description of what to build
@@ -235,7 +380,7 @@ def generate_code_stream(
         refinement: If provided, refine existing code with this instruction
 
     Yields:
-        (code_chunk, done) tuples
+        (code_chunk, done, usage) tuples
     """
     client = get_client()
 
@@ -264,6 +409,8 @@ def generate_code_stream(
         {"role": "user", "content": user_prompt},
     ]
 
+    empty_usage = {"prompt_tokens": None, "completion_tokens": None, "total_tokens": None, "estimated_cost": None}
+
     # Retry logic with exponential backoff
     max_retries = 3
     last_error = None
@@ -274,14 +421,23 @@ def generate_code_stream(
                 messages=messages,
                 temperature=temperature,
                 stream=True,
+                # Request usage in the final chunk
             )
 
             buffer = ""
             for chunk in stream:
                 delta = chunk.choices[0].delta.content or ""
+                # Extract usage from the last chunk if available
+                usage = empty_usage
+                if hasattr(chunk, 'usage') and chunk.usage:
+                    pt = chunk.usage.prompt_tokens or 0
+                    ct = chunk.usage.completion_tokens or 0
+                    tt = chunk.usage.total_tokens or 0
+                    cost = estimate_cost(model, pt, ct)
+                    usage = {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": tt, "estimated_cost": cost}
                 if delta:
                     buffer += delta
-                    yield delta, False
+                    yield delta, False, usage
 
             # Final cleanup: strip fences
             full = _strip_code_fences(buffer)
@@ -296,7 +452,7 @@ def generate_code_stream(
                     if not ok:
                         print(f"\n⚠ Validation warning: {msg}", file=sys.stderr)
 
-            yield "", True  # done signal
+            yield "", True, empty_usage  # done signal
             return  # exit after successful generation
 
         except AuthenticationError:
@@ -333,7 +489,7 @@ def generate_code(
     skip_validation: bool = False,
     refinement: str | None = None,
     existing_code: str | None = None,
-) -> str:
+) -> GenerationResult:
     """Generate code via OpenAI (non-streaming version for testing).
 
     Args:
@@ -346,7 +502,7 @@ def generate_code(
         existing_code: Existing code to refine
 
     Returns:
-        Generated code as a string
+        GenerationResult with code and usage metadata
     """
     client = get_client()
 
@@ -390,6 +546,15 @@ def generate_code(
             if not code:
                 raise CodeGenerationError("Empty response from API. Please try again.")
 
+            # Extract usage from response
+            usage = response.usage
+            prompt_tokens = usage.prompt_tokens if usage else None
+            completion_tokens = usage.completion_tokens if usage else None
+            total_tokens = usage.total_tokens if usage else None
+            cost = None
+            if prompt_tokens is not None and completion_tokens is not None:
+                cost = estimate_cost(model, prompt_tokens, completion_tokens)
+
             # Validation
             if not skip_validation:
                 lang_key = language.lower().split()[0]
@@ -398,7 +563,13 @@ def generate_code(
                     if not ok:
                         raise ValidationError(f"Validation failed: {msg}")
 
-            return code
+            return GenerationResult(
+                code=code,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                estimated_cost=cost,
+            )
 
         except AuthenticationError:
             raise APIKeyMissingError(

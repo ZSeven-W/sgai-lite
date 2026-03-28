@@ -45,6 +45,9 @@ sgai --git-commit "a Python CLI tool for managing todos"
 
 # Verbose mode (model info, dependencies, timing)
 sgai --verbose "a Python script that parses CSV files and makes charts"
+
+# Machine-readable JSON output with token usage and cost
+sgai --json "a Python function that reverses a string"
 ```
 
 ## Options
@@ -63,6 +66,7 @@ sgai --verbose "a Python script that parses CSV files and makes charts"
 | `--open` | Open generated file in default application |
 | `--install` | Auto-install detected Python dependencies |
 | `--git-commit` | Commit generated file to git |
+| `--json` | Machine-readable JSON output with metadata, tokens, and cost |
 | `--history` | Show generation history |
 | `--rerun N` | Regenerate from history entry N |
 | `--refine` | Refine an existing file with instructions |
@@ -91,7 +95,8 @@ sgai-lite/
 ├── history.py         # JSONL-based generation history (~/.sgai-lite/)
 ├── config.py          # Config file loading (JSON/YAML)
 ├── languages.py       # Language detection, extension mapping
-└── prompts.py         # Intent detection, language-specific tips
+├── prompts.py         # Intent detection, language-specific tips
+└── completions/       # Shell completions (bash, zsh)
 
 # Flow:
 #   CLI → detect intent → build prompt → OpenAI streaming → validate → save → history
@@ -101,7 +106,7 @@ sgai-lite/
 
 1. **Intent Detection** — Scans your goal for keywords (cli, web, data, gui, etc.) to select language-specific best-practice tips
 2. **Streaming Generation** — Sends goal to OpenAI with a crafted system prompt; code streams token-by-token to your terminal
-3. **Validation** — Python uses `compile()`, Bash uses `bash -n`, JS/TS checks bracket balance
+3. **Validation** — Python uses `compile()`, Bash uses `bash -n`, Go uses `gofmt`, Rust uses `rustfmt`, Ruby uses `ruby -c`, PHP uses `php -l`, Lua uses `lua -p`. Falls back gracefully if tools aren't installed.
 4. **Retry Logic** — Transient API errors (rate limits, timeouts) automatically retry with exponential backoff (up to 3 attempts)
 5. **History** — Every generation is saved to `~/.sgai-lite/history.jsonl` with metadata
 
@@ -127,6 +132,23 @@ sgai --install "a Python script that fetches GitHub repos and displays their sta
 ## Supported Languages
 
 Python, JavaScript, TypeScript, Bash/Shell, Go, Rust, Ruby, PHP, Java, C, C++, C#, Swift, Kotlin, Scala, R, Lua, Perl, Haskell, Elixir, Clojure, Dart, Vue, Svelte, HTML, CSS, SQL, YAML, JSON, TOML, Dockerfile, and more.
+
+## Shell Completions
+
+Install bash or zsh completions for a better experience:
+
+**Bash:**
+```bash
+# Add to ~/.bashrc
+source /path/to/sgai-lite/completions/sgai.bash
+```
+
+**Zsh:**
+```bash
+# Add to ~/.zshrc
+source /path/to/sgai-lite/completions/sgai.zsh
+# Or copy to your fpath
+```
 
 ## License
 

@@ -116,6 +116,9 @@ class TestRetryLogic:
         choice.message.content = "def hello(): pass\n"
         mock_response = MagicMock()
         mock_response.choices = [choice]
+        mock_response.usage.prompt_tokens = 50
+        mock_response.usage.completion_tokens = 10
+        mock_response.usage.total_tokens = 60
 
         mock_client.chat.completions.create.side_effect = [
             RateLimitError("rate limited", response=MagicMock(), body=None),
@@ -130,7 +133,7 @@ class TestRetryLogic:
                     language="python",
                     model="gpt-4o",
                 )
-        assert "hello" in result.lower()
+        assert "hello" in result.code.lower()
 
     def test_auth_error_no_retry(self):
         """Should raise immediately on AuthenticationError."""
@@ -150,6 +153,9 @@ class TestRetryLogic:
         choice.message.content = "def foo(): pass\n"
         mock_response = MagicMock()
         mock_response.choices = [choice]
+        mock_response.usage.prompt_tokens = 50
+        mock_response.usage.completion_tokens = 10
+        mock_response.usage.total_tokens = 60
 
         mock_client.chat.completions.create.side_effect = [
             APIError("api error", request=MagicMock(), body=None),
@@ -160,4 +166,4 @@ class TestRetryLogic:
         with patch("sgai_lite.generator.get_client", return_value=mock_client):
             with patch("sgai_lite.generator.time.sleep"):
                 result = generate_code(goal="foo function", language="python")
-        assert "foo" in result.lower()
+        assert "foo" in result.code.lower()

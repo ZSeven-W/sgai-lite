@@ -74,3 +74,18 @@ class TestLangSpecificTips:
         assert "rust" in LANG_SPECIFIC_TIPS
         tips = LANG_SPECIFIC_TIPS["rust"]
         assert "Result" in tips or "error" in tips.lower()
+
+    def test_ruby_tips_exist(self):
+        assert "ruby" in LANG_SPECIFIC_TIPS
+        tips = LANG_SPECIFIC_TIPS["ruby"]
+        assert len(tips) > 20
+
+    def test_php_tips_exist(self):
+        assert "php" in LANG_SPECIFIC_TIPS
+        tips = LANG_SPECIFIC_TIPS["php"]
+        assert len(tips) > 20
+
+    def test_lua_tips_exist(self):
+        assert "lua" in LANG_SPECIFIC_TIPS
+        tips = LANG_SPECIFIC_TIPS["lua"]
+        assert len(tips) > 20
