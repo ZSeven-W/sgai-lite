@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+import random
 import subprocess
 import tempfile
 from typing import Iterator
@@ -18,6 +19,14 @@ DEFAULT_MODEL = "gpt-4o"
 
 # Languages that support syntax validation
 VALIDATABLE_LANGUAGES = {"python", "py", "js", "javascript", "ts", "typescript", "bash", "sh", "shell"}
+
+# OpenAI pricing (approximate, per 1M tokens)
+PRICING = {
+    "gpt-4o": {"input": 2.5, "output": 10.0},
+    "gpt-4o-mini": {"input": 0.15, "output": 0.60},
+    "gpt-4-turbo": {"input": 10.0, "output": 30.0},
+    "gpt-3.5-turbo": {"input": 0.50, "output": 1.50},
+}
 
 
 class CodeGenerationError(Exception):
@@ -33,6 +42,53 @@ class APIKeyMissingError(Exception):
 class ValidationError(Exception):
     """Raised when generated code fails validation."""
     pass
+
+
+def detect_imports(code: str) -> list[str]:
+    """Detect third-party imports from Python code."""
+    import re
+    # Standard library modules to ignore
+    stdlib = {
+        "os", "sys", "re", "json", "csv", "xml", "html", "time", "datetime",
+        "random", "math", "statistics", "collections", "itertools", "functools",
+        "operator", "string", "textwrap", "unicodedata", "locale", "copy",
+        "abc", "dataclasses", "enum", "typing", "pathlib", "io", "os.path",
+        "urllib", "http", "ftplib", "smtplib", "poplib", "imaplib", "socket",
+        "argparse", "getopt", "logging", "warnings", "dateutil", "pprint",
+        "struct", "codecs", "gc", "weakref", "types", "inspect", "dis",
+        "ast", "platform", "errno", "ctypes", "signal", "mmap", "shutil",
+        "tempfile", "glob", "fnmatch", "linecache", "tokenize", "keyword",
+        "ast", "symtable", "token", "tabnanny", "py_compile", "pickle",
+        " shelve", "dbm", "sqlite3", "zlib", "gzip", "bz2", "lzma", "zipfile",
+        "tarfile", "fileinput", "stat", "filecmp", "difflib", "mailbox",
+        "subprocess", "sysconfig", "webbrowser", "turtle", "tracemalloc",
+        "concurrent", "multiprocessing", "asyncio", "queue", "threading",
+        "contextvars", "contextlib", "typing_extensions", "fractions",
+        "decimal", "numbers", "cmath", "cProfile", "profile", "resource",
+        "test", "unittest", "doctest", "traceback", "sysconfig", "pkgutil",
+        "venv", "zipapp", "__future__", "builtins",
+    }
+
+    # Regex to find import X and from X import Y
+    pattern = re.compile(r'^\s*(?:from|import)\s+([a-zA-Z_][a-zA-Z0-9_]*)', re.MULTILINE)
+    candidates = pattern.findall(code)
+
+    # Filter: only third-party (not stdlib), take first part of dotted imports
+    third_party = []
+    for module in candidates:
+        base = module.split('.')[0].lower()
+        if base not in stdlib and base not in third_party:
+            third_party.append(base)
+
+    return sorted(third_party)
+
+
+def estimate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
+    """Estimate generation cost in USD."""
+    prices = PRICING.get(model, {"input": 2.5, "output": 10.0})
+    input_cost = (prompt_tokens / 1_000_000) * prices["input"]
+    output_cost = (completion_tokens / 1_000_000) * prices["output"]
+    return input_cost + output_cost
 
 
 def get_client() -> OpenAI:
@@ -203,53 +259,70 @@ def generate_code_stream(
     else:
         user_prompt = f"Goal: {goal}"
 
-    try:
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
 
-        stream = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=temperature,
-            stream=True,
-        )
+    # Retry logic with exponential backoff
+    max_retries = 3
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            stream = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                stream=True,
+            )
 
-        buffer = ""
-        for chunk in stream:
-            delta = chunk.choices[0].delta.content or ""
-            if delta:
-                buffer += delta
-                yield delta, False
+            buffer = ""
+            for chunk in stream:
+                delta = chunk.choices[0].delta.content or ""
+                if delta:
+                    buffer += delta
+                    yield delta, False
 
-        # Final cleanup: strip fences
-        full = _strip_code_fences(buffer)
-        if not full:
-            raise CodeGenerationError("Empty response from API. Please try again.")
+            # Final cleanup: strip fences
+            full = _strip_code_fences(buffer)
+            if not full:
+                raise CodeGenerationError("Empty response from API. Please try again.")
 
-        # Validation
-        if not skip_validation:
-            lang_key = language.lower().split()[0]
-            if lang_key in VALIDATABLE_LANGUAGES:
-                ok, msg = validate_code(full, language)
-                if not ok:
-                    print(f"\n⚠ Validation warning: {msg}", file=sys.stderr)
+            # Validation
+            if not skip_validation:
+                lang_key = language.lower().split()[0]
+                if lang_key in VALIDATABLE_LANGUAGES:
+                    ok, msg = validate_code(full, language)
+                    if not ok:
+                        print(f"\n⚠ Validation warning: {msg}", file=sys.stderr)
 
-        yield "", True  # done signal
+            yield "", True  # done signal
+            return  # exit after successful generation
 
-    except AuthenticationError:
-        raise APIKeyMissingError(
-            "Authentication failed. Check your OPENAI_API_KEY.\n"
-            "Get your key at: https://platform.openai.com/api-keys"
-        )
-    except RateLimitError:
-        raise CodeGenerationError(
-            "Rate limit hit. Please wait a moment and try again.\n"
-            "Consider setting a different model: --model gpt-4o-mini"
-        )
-    except APIError as e:
-        raise CodeGenerationError(f"OpenAI API error: {e}")
+        except AuthenticationError:
+            raise APIKeyMissingError(
+                "Authentication failed. Check your OPENAI_API_KEY.\n"
+                "Get your key at: https://platform.openai.com/api-keys"
+            )
+        except RateLimitError as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                wait_time = (2 ** attempt) + random.uniform(0, 1)
+                print(f"\n⚠ Rate limited. Retrying in {wait_time:.1f}s... (attempt {attempt + 1}/{max_retries})", file=sys.stderr)
+                time.sleep(wait_time)
+            else:
+                raise CodeGenerationError(
+                    f"Rate limit hit after {max_retries} retries. Please wait and try again.\n"
+                    "Consider setting a different model: --model gpt-4o-mini"
+                )
+        except APIError as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                wait_time = (2 ** attempt) + random.uniform(0, 1)
+                print(f"\n⚠ API error ({e}). Retrying in {wait_time:.1f}s... (attempt {attempt + 1}/{max_retries})", file=sys.stderr)
+                time.sleep(wait_time)
+            else:
+                raise CodeGenerationError(f"OpenAI API error after {max_retries} retries: {e}")
 
 
 def generate_code(
@@ -297,38 +370,54 @@ def generate_code(
     else:
         user_prompt = f"Goal: {goal}"
 
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=temperature,
-        )
+    # Retry logic with exponential backoff
+    max_retries = 3
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=temperature,
+            )
 
-        raw = response.choices[0].message.content or ""
-        code = _strip_code_fences(raw)
+            raw = response.choices[0].message.content or ""
+            code = _strip_code_fences(raw)
 
-        if not code:
-            raise CodeGenerationError("Empty response from API. Please try again.")
+            if not code:
+                raise CodeGenerationError("Empty response from API. Please try again.")
 
-        # Validation
-        if not skip_validation:
-            lang_key = language.lower().split()[0]
-            if lang_key in VALIDATABLE_LANGUAGES:
-                ok, msg = validate_code(code, language)
-                if not ok:
-                    raise ValidationError(f"Validation failed: {msg}")
+            # Validation
+            if not skip_validation:
+                lang_key = language.lower().split()[0]
+                if lang_key in VALIDATABLE_LANGUAGES:
+                    ok, msg = validate_code(code, language)
+                    if not ok:
+                        raise ValidationError(f"Validation failed: {msg}")
 
-        return code
+            return code
 
-    except AuthenticationError:
-        raise APIKeyMissingError(
-            "Authentication failed. Check your OPENAI_API_KEY.\n"
-            "Get your key at: https://platform.openai.com/api-keys"
-        )
-    except RateLimitError:
-        raise CodeGenerationError("Rate limit hit. Please wait and try again.")
-    except APIError as e:
-        raise CodeGenerationError(f"OpenAI API error: {e}")
+        except AuthenticationError:
+            raise APIKeyMissingError(
+                "Authentication failed. Check your OPENAI_API_KEY.\n"
+                "Get your key at: https://platform.openai.com/api-keys"
+            )
+        except RateLimitError as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                wait_time = (2 ** attempt) + random.uniform(0, 1)
+                time.sleep(wait_time)
+            else:
+                raise CodeGenerationError(
+                    f"Rate limit hit after {max_retries} retries. Please wait and try again."
+                )
+        except APIError as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                wait_time = (2 ** attempt) + random.uniform(0, 1)
+                time.sleep(wait_time)
+            else:
+                raise CodeGenerationError(f"OpenAI API error after {max_retries} retries: {e}")

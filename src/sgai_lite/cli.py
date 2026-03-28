@@ -28,6 +28,7 @@ from sgai_lite.generator import (
     APIKeyMissingError,
     ValidationError,
     DEFAULT_MODEL,
+    detect_imports,
 )
 from sgai_lite.languages import detect_language, get_extension, get_language_name, LANGUAGE_MAP
 from sgai_lite.history import add_entry, list_entries, get_entry, format_entries, clear_history
@@ -89,6 +90,126 @@ def _write_file(output_path: str, content: str) -> bool:
     except OSError as e:
         _print_error(f"Failed to write {output_path}: {e}")
         return False
+
+
+def _is_in_git_repo(path: str) -> bool:
+    """Check if a path is inside a git repository."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=os.path.dirname(os.path.abspath(path)) if os.path.isfile(path) else path,
+            capture_output=True, text=True, timeout=5,
+        )
+        return result.returncode == 0 and result.stdout.strip() == "true"
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+def _git_commit_file(file_path: str, goal: str) -> bool:
+    """Commit a generated file to git."""
+    import subprocess
+    try:
+        abs_path = os.path.abspath(file_path)
+        rel_path = os.path.basename(abs_path)
+        # Truncate goal for commit message
+        msg = f"feat: generated {rel_path} — {goal[:80]}"
+        subprocess.run(["git", "add", abs_path], check=True, capture_output=True, timeout=10)
+        subprocess.run(
+            ["git", "commit", "-m", msg],
+            check=True, capture_output=True, text=True, timeout=10,
+        )
+        return True
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return False
+
+
+def _open_file(file_path: str) -> bool:
+    """Open file in default application (browser for web files, editor for code)."""
+    import subprocess
+    try:
+        abs_path = os.path.abspath(file_path)
+        if sys.platform == "darwin":
+            subprocess.run(["open", abs_path], check=False, capture_output=True, timeout=10)
+        elif sys.platform == "win32":
+            subprocess.run(["start", "", abs_path], shell=True, check=False, capture_output=True, timeout=10)
+        else:
+            subprocess.run(["xdg-open", abs_path], check=False, capture_output=True, timeout=10)
+        return True
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+def _install_dependencies(code: str, language: str) -> list[str]:
+    """Attempt to install detected dependencies. Returns list of installed packages."""
+    import subprocess
+    lang_key = language.lower().split()[0]
+    if lang_key not in ("python", "py"):
+        return []
+
+    imports = detect_imports(code)
+    installed = []
+    for pkg in imports:
+        # Map common import names to package names
+        pkg_map = {
+            "requests": "requests",
+            "click": "click",
+            "rich": "rich",
+            "typer": "typer",
+            "fastapi": "fastapi",
+            "flask": "flask",
+            "django": "django",
+            "pandas": "pandas",
+            "numpy": "numpy",
+            "pydantic": "pydantic",
+            "sqlalchemy": "sqlalchemy",
+            "pytest": "pytest",
+            "matplotlib": "matplotlib",
+            "seaborn": "seaborn",
+            "aiohttp": "aiohttp",
+            "httpx": "httpx",
+            "beautifulsoup4": "beautifulsoup4",
+            "lxml": "lxml",
+            "pyyaml": "pyyaml",
+            "toml": "toml",
+            "tqdm": "tqdm",
+            "pillow": "pillow",
+            "cryptography": "cryptography",
+            "boto3": "boto3",
+            "redis": "redis",
+            "pymongo": "pymongo",
+            "psycopg2": "psycopg2-binary",
+            "mysql": "mysql-connector-python",
+            "jinja2": "jinja2",
+            "markdown": "markdown",
+            "pytest": "pytest",
+            "playwright": "playwright",
+            "selenium": "selenium",
+            "streamlit": "streamlit",
+            "gradio": "gradio",
+            "inquirer": "inquirer",
+            "questionary": "questionary",
+            "prompt_toolkit": "prompt-toolkit",
+            "click": "click",
+            "typer": "typer",
+            "black": "black",
+            "ruff": "ruff",
+            "mypy": "mypy",
+            "pylint": "pylint",
+        }
+        pip_name = pkg_map.get(pkg, pkg)
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install", pip_name],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode == 0:
+                installed.append(pip_name)
+            else:
+                pass  # silently skip failures
+        except subprocess.TimeoutExpired:
+            pass
+    return installed
 
 
 def _format_code(code: str, formatter: str | None) -> str:
@@ -166,6 +287,48 @@ def _format_code(code: str, formatter: str | None) -> str:
                 pass
 
     return code
+
+
+# Language color map for output
+_LANG_COLORS = {
+    "python": _CYAN,
+    "javascript": _YELLOW,
+    "typescript": Fore.BLUE if hasattr(Fore, 'BLUE') else _CYAN,
+    "bash": _GREEN,
+    "shell": _GREEN,
+    "go": Fore.CYAN if hasattr(Fore, 'CYAN') else _CYAN,
+    "rust": Fore.RED if hasattr(Fore, 'RED') else _YELLOW,
+    "html": _RED,
+    "css": Fore.BLUE if hasattr(Fore, 'BLUE') else _CYAN,
+    "sql": _YELLOW,
+    "yaml": _GREEN,
+    "json": _CYAN,
+    "dockerfile": _CYAN,
+}
+
+
+def _language_color(language: str) -> str:
+    """Get color for a language."""
+    lang_key = language.lower().split()[0]
+    return _LANG_COLORS.get(lang_key, _CYAN)
+
+
+_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+_spinner_index = 0
+
+
+def _print_spinner(label: str = "Generating"):
+    """Print a spinning cursor with label."""
+    global _spinner_index
+    _spinner_index = (_spinner_index + 1) % len(_SPINNER_FRAMES)
+    frame = _SPINNER_FRAMES[_spinner_index]
+    # \r moves cursor to beginning, \b backspaces one char, space overwrites
+    print(f"\r{_CYAN}{frame}{_RESET} {label}...", end="", flush=True)
+
+
+def _clear_spinner():
+    """Clear the spinner line."""
+    print("\r" + " " * 60 + "\r", end="", flush=True)
 
 
 def _show_history(n: int = 10):
@@ -336,6 +499,26 @@ Environment:
         action="version",
         version=f"sgai-lite {__version__}",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Show model, language, and token info during generation",
+    )
+    parser.add_argument(
+        "--open",
+        action="store_true",
+        help="Open the generated file in the default application",
+    )
+    parser.add_argument(
+        "--install",
+        action="store_true",
+        help="Auto-install detected third-party dependencies (Python only)",
+    )
+    parser.add_argument(
+        "--git-commit",
+        action="store_true",
+        help="Automatically commit the generated file to git (if in a git repo)",
+    )
 
     args = parser.parse_args()
 
@@ -413,6 +596,9 @@ Environment:
         _print_header(goal, lang)
 
         full_code = ""
+        import time as _time_module
+        start_time = _time_module.time()
+        last_spin = 0
         try:
             for chunk, done in generate_code_stream(
                 goal=goal,
@@ -422,9 +608,16 @@ Environment:
                 skip_validation=args.no_validate,
             ):
                 if chunk:
+                    _clear_spinner()
                     print(chunk, end="", flush=True)
                     full_code += chunk
+                    now = _time_module.time()
+                    if now - last_spin > 0.1:
+                        elapsed = int(now - start_time)
+                        _print_spinner(f"Regenerating ({elapsed}s)")
+                        last_spin = now
                 if done:
+                    _clear_spinner()
                     break
         except CodeGenerationError as e:
             _print_error(str(e))
@@ -479,9 +672,19 @@ Environment:
 
     _print_header(args.goal, language)
 
-    # Stream and display
+    # Verbose info
+    if args.verbose:
+        print(f"{_bold('Model:')} {args.model}")
+        print(f"{_bold('Language:')} {language}")
+        print(f"{_bold('Temperature:')} {args.temp}")
+        print()
+
+    # Stream and display with spinner
     full_code = ""
     validation_ok = True
+    import time as _time_module
+    start_time = _time_module.time()
+    last_spin = 0
     try:
         for chunk, done in generate_code_stream(
             goal=args.goal,
@@ -491,11 +694,22 @@ Environment:
             skip_validation=args.no_validate,
         ):
             if chunk:
+                _clear_spinner()
+                # Colorize language header
+                lang_col = _language_color(language)
                 print(chunk, end="", flush=True)
                 full_code += chunk
+                # Update spinner every 0.1s
+                now = _time_module.time()
+                if now - last_spin > 0.1:
+                    elapsed = int(now - start_time)
+                    _print_spinner(f"Generating ({elapsed}s)")
+                    last_spin = now
             if done:
+                _clear_spinner()
                 break
     except KeyboardInterrupt:
+        _clear_spinner()
         print(f"\n{_yellow('Interrupted by user.')}")
         if full_code:
             save = input(f"\nSave partial output to {output_path}? [y/N]: ").strip().lower()
@@ -506,6 +720,7 @@ Environment:
 
     print()
 
+    elapsed = _time_module.time() - start_time
     if not full_code.strip():
         _print_error("No code was generated. Please try again.")
         return 1
@@ -524,7 +739,40 @@ Environment:
         _print_success(f"Saved to {output_path}")
         line_count = full_code.count("\n") + 1
         char_count = len(full_code)
-        print(f"  {line_count} lines, {char_count} chars")
+        print(f"  {line_count} lines, {char_count} chars, {elapsed:.1f}s")
+
+        # Verbose: show detected dependencies
+        if args.verbose:
+            imports = detect_imports(full_code)
+            if imports:
+                print(f"  {_bold('Dependencies:')} {', '.join(imports)}")
+
+        # Auto-install dependencies
+        if args.install:
+            lang_key = language.lower().split()[0]
+            if lang_key in ("python", "py"):
+                installed = _install_dependencies(full_code, language)
+                if installed:
+                    print(f"  {_green('Installed:')} {', '.join(installed)}")
+                else:
+                    print(f"  {_yellow('No third-party dependencies detected')}")
+
+    # Git commit
+    if args.git_commit:
+        if _is_in_git_repo(output_path):
+            if _git_commit_file(output_path, args.goal):
+                _print_success("Committed to git.")
+            else:
+                _print_warning("Git commit failed (check git status).")
+        else:
+            _print_warning("Not in a git repository. Skipping commit.")
+
+    # Auto-open
+    if args.open:
+        if _open_file(output_path):
+            print(f"  {_cyan('Opened')} {output_path}")
+        else:
+            _print_warning(f"Could not open {output_path}")
 
     # Record history
     entry_idx = add_entry(args.goal, language, args.model, full_code, output_path, args.temp)

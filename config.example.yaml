@@ -1,0 +1,28 @@
+# sgai-lite Configuration
+# Copy to ~/.sgai-lite/config.yaml or ~/.sgai-lite/config.json
+
+# Default OpenAI model (gpt-4o, gpt-4o-mini, gpt-4-turbo, gpt-3.5-turbo)
+default_model: gpt-4o
+
+# Default target language (null = auto-detect)
+# Uncomment to set a default language
+# default_language: python
+
+# Sampling temperature (0.0 = deterministic, 2.0 = creative)
+# Lower values = more predictable, consistent code
+temperature: 0.3
+
+# Validate generated code syntax (true/false)
+validate: true
+
+# Auto-format Python code after generation
+# Options: black, ruff, autopep8, none
+# formatter: black
+
+# Custom system prompt (advanced)
+# system_prompt: |
+#   You are an expert {language} developer.
+#   Write clean, well-documented code following best practices.
+
+# OpenAI API base URL (for proxies/custom endpoints)
+# openai_base_url: https://api.openai.com/v1
